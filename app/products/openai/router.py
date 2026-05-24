@@ -307,8 +307,10 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
                 emit_think=emit_think,
                 tools=req.tools,
                 tool_choice=req.tool_choice,
-                temperature=req.temperature or 0.8,
-                top_p=req.top_p or 0.95,
+                temperature=req.temperature if req.temperature is not None else 0.7,
+                top_p=req.top_p if req.top_p is not None else 0.95,
+                reasoning_effort=req.reasoning_effort,
+                max_output_tokens=req.max_tokens or 1000000,
             )
 
     except AppError:
@@ -395,12 +397,15 @@ async def responses_endpoint(req: ResponsesCreateRequest):
 
     # Map reasoning param → emit_think flag.
     # reasoning=None → use config; reasoning.effort="none" → off; otherwise on.
+    reasoning_effort = None
     if req.reasoning is None:
         emit_think = cfg.get_bool("features.thinking", True)
     elif isinstance(req.reasoning, dict) and req.reasoning.get("effort") == "none":
         emit_think = False
     else:
         emit_think = True
+        if isinstance(req.reasoning, dict):
+            reasoning_effort = req.reasoning.get("effort")
 
     from .responses import create as responses_create
 
@@ -410,10 +415,12 @@ async def responses_endpoint(req: ResponsesCreateRequest):
         instructions=req.instructions,
         stream=is_stream,
         emit_think=emit_think,
-        temperature=req.temperature or 0.8,
-        top_p=req.top_p or 0.95,
+        temperature=req.temperature if req.temperature is not None else 0.7,
+        top_p=req.top_p if req.top_p is not None else 0.95,
         tools=req.tools or None,
         tool_choice=req.tool_choice,
+        reasoning_effort=reasoning_effort,
+        max_output_tokens=req.max_output_tokens or 1000000,
     )
 
     if isinstance(result, dict):

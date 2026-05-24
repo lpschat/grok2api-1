@@ -17,7 +17,11 @@ from app.platform.tokens import estimate_prompt_tokens, estimate_tokens, estimat
 from app.control.model.enums import ModeId
 from app.control.model.registry import resolve as resolve_model
 from app.control.account.enums import FeedbackKind
-from app.dataplane.reverse.protocol.xai_chat import classify_line, StreamAdapter
+from app.dataplane.reverse.protocol.xai_chat import (
+    build_console_input,
+    classify_line,
+    StreamAdapter,
+)
 from app.products._account_selection import reserve_account, selection_max_retries
 
 from .chat import _stream_chat, _extract_message, _resolve_image, _quota_sync, _fail_sync, _parse_retry_codes, _feedback_kind, _log_task_exception, _upstream_body_excerpt
@@ -213,21 +217,25 @@ async def create(
     instructions: str | None,
     stream:       bool,
     emit_think:   bool,
-    temperature:  float,
-    top_p:        float,
+    temperature:  float = 0.7,
+    top_p:        float = 0.95,
     tools:        list[dict] | None = None,
     tool_choice:  Any = None,
+    reasoning_effort: str | None = None,
+    max_output_tokens: int = 1000000,
 ) -> dict | AsyncGenerator[str, None]:
 
     cfg     = get_config()
     spec    = resolve_model(model)
     mode_id = int(spec.mode_id)   # cast once, reuse everywhere
 
+    input_messages = _parse_input(input_val)
     messages: list[dict] = []
     if instructions:
         messages.append({"role": "system", "content": instructions})
-    messages.extend(_parse_input(input_val))
+    messages.extend(input_messages)
 
+    input_items, input_files = build_console_input(input_messages)
     message, files = _extract_message(messages)
     if not message.strip():
         raise UpstreamError("Empty message after extraction", status=400)
@@ -240,7 +248,17 @@ async def create(
         tool_names = extract_tool_names(chat_tools)
         tool_prompt = build_tool_system_prompt(chat_tools, tool_choice)
         message = inject_into_message(message, tool_prompt)
-        logger.info("responses tool injection: tool_names={} choice={}", tool_names, tool_choice)
+        input_items = [{
+            "role": "user",
+            "content": [{"type": "input_text", "text": message}],
+        }]
+        logger.info(
+            "responses tool injection: tool_names={} choice={}",
+            tool_names,
+            tool_choice,
+        )
+    elif input_files:
+        files = input_files
 
     from app.dataplane.account import _directory as _acct_dir
     if _acct_dir is None:
@@ -297,6 +315,13 @@ async def create(
                         mode_id   = ModeId(selected_mode_id),
                         message   = message,
                         files     = files,
+                        model     = model,
+                        input_items = input_items,
+                        instructions = instructions,
+                        temperature = temperature,
+                        top_p = top_p,
+                        reasoning_effort = reasoning_effort,
+                        max_output_tokens = max_output_tokens,
                         timeout_s = timeout_s,
                     ):
                         if tool_calls_emitted:
@@ -630,6 +655,13 @@ async def create(
                     mode_id   = ModeId(selected_mode_id),
                     message   = message,
                     files     = files,
+                    model     = model,
+                    input_items = input_items,
+                    instructions = instructions,
+                    temperature = temperature,
+                    top_p = top_p,
+                    reasoning_effort = reasoning_effort,
+                    max_output_tokens = max_output_tokens,
                     timeout_s = timeout_s,
                 ):
                     event_type, data = classify_line(line)

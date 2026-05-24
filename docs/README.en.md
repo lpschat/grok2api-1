@@ -241,6 +241,7 @@ Runtime config can also be overridden with `GROK_`-prefixed environment variable
 | `grok-4.20-auto` | `auto` | `super`, prefers higher-tier pools |
 | `grok-4.20-expert` | `expert` | `super`, prefers higher-tier pools |
 | `grok-4.20-heavy` | `heavy` | `heavy` |
+| `grok-4.3` | `grok-4.3` | `super` |
 | `grok-4.3-beta` | `grok-420-computer-use-sa` | `super` |
 
 ### Image

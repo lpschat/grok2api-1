@@ -22,7 +22,11 @@ from app.platform.tokens import estimate_prompt_tokens, estimate_tokens, estimat
 from app.control.model.enums import ModeId
 from app.control.model.registry import resolve as resolve_model
 from app.control.account.enums import FeedbackKind
-from app.dataplane.reverse.protocol.xai_chat import classify_line, StreamAdapter
+from app.dataplane.reverse.protocol.xai_chat import (
+    build_console_input,
+    classify_line,
+    StreamAdapter,
+)
 from app.dataplane.reverse.protocol.tool_prompt import (
     build_tool_system_prompt, extract_tool_names, inject_into_message,
 )
@@ -278,8 +282,8 @@ async def create(
     system:       str | list | None = None,
     stream:       bool,
     emit_think:   bool,
-    temperature:  float,
-    top_p:        float,
+    temperature:  float = 0.7,
+    top_p:        float = 0.95,
     tools:        list[dict] | None = None,
     tool_choice:  Any = None,
 ) -> dict | AsyncGenerator[str, None]:
@@ -290,6 +294,7 @@ async def create(
 
     # Build internal message list
     internal_messages = _parse_anthropic_messages(messages, system)
+    input_items, input_files = build_console_input(internal_messages)
     internal_message, files = _extract_message(internal_messages)
     if not internal_message.strip():
         raise UpstreamError("Empty message after extraction", status=400)
@@ -303,7 +308,17 @@ async def create(
         internal_tool_choice = _convert_tool_choice(tool_choice)
         tool_prompt      = build_tool_system_prompt(chat_tools, internal_tool_choice)
         internal_message = inject_into_message(internal_message, tool_prompt)
-        logger.info("messages tool injection: tool_names={} choice={}", tool_names, internal_tool_choice)
+        input_items = [{
+            "role": "user",
+            "content": [{"type": "input_text", "text": internal_message}],
+        }]
+        logger.info(
+            "messages tool injection: tool_names={} choice={}",
+            tool_names,
+            internal_tool_choice,
+        )
+    elif input_files:
+        files = input_files
 
     from app.dataplane.account import _directory as _acct_dir
     if _acct_dir is None:
@@ -369,6 +384,10 @@ async def create(
                         mode_id   = ModeId(selected_mode_id),
                         message   = internal_message,
                         files     = files,
+                        model     = model,
+                        input_items = input_items,
+                        temperature = temperature,
+                        top_p = top_p,
                         timeout_s = timeout_s,
                     ):
                         if tool_calls_emitted:
@@ -651,6 +670,10 @@ async def create(
                     mode_id   = ModeId(selected_mode_id),
                     message   = internal_message,
                     files     = files,
+                    model     = model,
+                    input_items = input_items,
+                    temperature = temperature,
+                    top_p = top_p,
                     timeout_s = timeout_s,
                 ):
                     event_type, data = classify_line(line)

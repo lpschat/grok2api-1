@@ -31,12 +31,14 @@ from app.dataplane.proxy.adapters.session import (
     build_session_kwargs,
 )
 from app.dataplane.reverse.protocol.xai_chat import (
-    build_chat_payload,
+    build_console_input,
+    build_responses_payload,
     classify_line,
     StreamAdapter,
+    upstream_model_name,
 )
 from app.dataplane.reverse.protocol.xai_usage import is_invalid_credentials_error
-from app.dataplane.reverse.runtime.endpoint_table import CHAT
+from app.dataplane.reverse.runtime.endpoint_table import CONSOLE_BASE, CONSOLE_RESPONSES
 from app.dataplane.reverse.transport.asset_upload import upload_from_input
 from app.dataplane.reverse.protocol.tool_prompt import (
     build_tool_system_prompt,
@@ -365,6 +367,14 @@ def _extract_message(messages: list[dict]) -> tuple[str, list[str]]:
     return "\n\n".join(parts), files
 
 
+def _console_input_from_prompt(message: str, files: list[str]) -> list[dict]:
+    content: list[dict] = [{"type": "input_text", "text": message}]
+    for file_input in files:
+        if file_input:
+            content.append({"type": "input_image", "image_url": file_input})
+    return [{"role": "user", "content": content}]
+
+
 async def _prepare_file_attachments(token: str, file_inputs: list[str]) -> list[str]:
     """Upload OpenAI-style multimodal inputs and return Grok chat attachment IDs."""
     attachments: list[str] = []
@@ -383,22 +393,31 @@ async def _stream_chat(
     message: str,
     files: list[str],
     *,
+    model: str | None = None,
+    input_items: list[dict] | None = None,
+    instructions: str | None = None,
     tool_overrides: dict | None = None,
     model_config_override: dict | None = None,
     request_overrides: dict | None = None,
+    reasoning_effort: str | None = None,
+    max_output_tokens: int = 1000000,
+    temperature: float = 0.7,
+    top_p: float = 0.95,
     timeout_s: float = 120.0,
 ) -> AsyncGenerator[str, None]:
-    """Yield raw SSE lines from the Grok app-chat endpoint."""
+    """Yield raw SSE lines from the console.x.ai Responses endpoint."""
     proxy = await get_proxy_runtime()
     lease = await proxy.acquire()
-    attachments = await _prepare_file_attachments(token, files)
-
-    payload = build_chat_payload(
-        message=message,
-        mode_id=mode_id,
-        file_attachments=attachments,
-        tool_overrides=tool_overrides,
-        model_config_override=model_config_override,
+    upstream_model = upstream_model_name(model or "", mode_id)
+    payload = build_responses_payload(
+        model=upstream_model,
+        input_items=input_items or _console_input_from_prompt(message, files),
+        instructions=instructions,
+        temperature=temperature,
+        top_p=top_p,
+        reasoning_effort=reasoning_effort,
+        max_output_tokens=max_output_tokens,
+        tool_choice="auto",
         request_overrides=request_overrides,
     )
     payload_bytes = orjson.dumps(payload)
@@ -406,16 +425,18 @@ async def _stream_chat(
     headers = build_http_headers(
         token,
         content_type="application/json",
-        origin="https://grok.com",
-        referer="https://grok.com/",
+        origin=CONSOLE_BASE,
+        referer=f"{CONSOLE_BASE}/",
         lease=lease,
     )
+    headers["Authorization"] = "Bearer anonymous"
+    headers["x-cluster"] = "https://us-east-1.api.x.ai"
     session_kwargs = build_session_kwargs(lease=lease)
 
     async with ResettableSession(**session_kwargs) as session:
         try:
             response = await session.post(
-                CHAT,
+                CONSOLE_RESPONSES,
                 headers=headers,
                 data=payload_bytes,
                 timeout=timeout_s,
@@ -454,8 +475,10 @@ async def completions(
     emit_think: bool | None = None,
     tools: list[dict] | None = None,
     tool_choice: Any = None,
-    temperature: float = 0.8,
+    temperature: float = 0.7,
     top_p: float = 0.95,
+    reasoning_effort: str | None = None,
+    max_output_tokens: int = 1000000,
     request_overrides: dict | None = None,
 ) -> dict | AsyncGenerator[str, None]:
     """Entry point for /v1/chat/completions.
@@ -477,6 +500,7 @@ async def completions(
         len(messages),
     )
 
+    input_items, input_files = build_console_input(messages)
     message, files = _extract_message(messages)
     if not message.strip():
         raise UpstreamError("Empty message after extraction", status=400)
@@ -498,6 +522,9 @@ async def completions(
         tool_names = extract_tool_names(tools)
         tool_prompt = build_tool_system_prompt(tools, tool_choice)
         message = inject_into_message(message, tool_prompt)
+        input_items = _console_input_from_prompt(message, files)
+    elif input_files:
+        files = input_files
     tool_overrides: dict | None = None
 
     # ── Streaming path ────────────────────────────────────────────────────────
@@ -532,6 +559,12 @@ async def completions(
                             mode_id=ModeId(selected_mode_id),
                             message=message,
                             files=files,
+                            model=model,
+                            input_items=input_items,
+                            temperature=temperature,
+                            top_p=top_p,
+                            reasoning_effort=reasoning_effort,
+                            max_output_tokens=max_output_tokens,
                             tool_overrides=tool_overrides,
                             request_overrides=request_overrides,
                             timeout_s=timeout_s,
@@ -748,6 +781,12 @@ async def completions(
                     mode_id=ModeId(selected_mode_id),
                     message=message,
                     files=files,
+                    model=model,
+                    input_items=input_items,
+                    temperature=temperature,
+                    top_p=top_p,
+                    reasoning_effort=reasoning_effort,
+                    max_output_tokens=max_output_tokens,
                     tool_overrides=tool_overrides,
                     request_overrides=request_overrides,
                     timeout_s=timeout_s,

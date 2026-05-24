@@ -50,6 +50,8 @@ app/data/
 .pytest_cache/
 .coverage
 htmlcov/
+HAR/
+tests/
 
 # Project specific
 .ace-tool/

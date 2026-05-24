@@ -31,7 +31,7 @@ class ChatCompletionRequest(BaseModel):
     messages:            list[MessageItem]
     stream:              bool | None                = None
     reasoning_effort:    str | None                 = None
-    temperature:         float | None               = 0.8
+    temperature:         float | None               = 0.7
     top_p:               float | None               = 0.95
     image_config:        ImageConfig | None         = None
     video_config:        VideoConfig | None         = None

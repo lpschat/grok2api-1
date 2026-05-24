@@ -13,6 +13,166 @@ from app.control.model.enums import ModeId
 from app.dataplane.reverse.protocol.xai_chat_reasoning import ReasoningAggregator
 
 
+_DEFAULT_RESPONSES_TOOLS: tuple[dict[str, Any], ...] = (
+    {"type": "web_search", "enable_image_understanding": True},
+    {"type": "x_search", "enable_video_understanding": True},
+)
+
+_MODE_MODEL_IDS: dict[ModeId, str] = {
+    ModeId.AUTO:     "grok-4.20-0309",
+    ModeId.FAST:     "grok-4.20-0309-non-reasoning",
+    ModeId.EXPERT:   "grok-4.20-0309-reasoning",
+    ModeId.HEAVY:    "grok-4.20-multi-agent-0309",
+    ModeId.GROK_4_3: "grok-4.3",
+}
+
+_MODEL_ALIASES: dict[str, str] = {
+    "grok-4.3-beta": "grok-4.3",
+}
+
+
+def upstream_model_name(model_name: str, mode_id: ModeId | int | None = None) -> str:
+    """Return the console.x.ai model id used in the HAR request body."""
+    alias = _MODEL_ALIASES.get(model_name, model_name)
+    if mode_id is None:
+        return alias
+    try:
+        mode = mode_id if isinstance(mode_id, ModeId) else ModeId(int(mode_id))
+    except (TypeError, ValueError):
+        return alias
+    return _MODE_MODEL_IDS.get(mode, alias)
+
+
+def build_console_input(messages: list[dict]) -> tuple[list[dict], list[str]]:
+    """Convert OpenAI-style messages to console.x.ai Responses ``input`` items."""
+    input_items: list[dict] = []
+    files: list[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "user")
+        content = msg.get("content") or ""
+
+        if role == "tool":
+            text = _content_to_text(content)
+            if text:
+                input_items.append({
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": f"[tool result]:\n{text}",
+                    }],
+                })
+            continue
+
+        if role == "assistant":
+            text = _content_to_text(content)
+            if text:
+                input_items.append({"role": "assistant", "content": text})
+            continue
+
+        parts, extracted_files = _content_to_input_parts(content)
+        files.extend(extracted_files)
+        if parts:
+            input_items.append({"role": role, "content": parts})
+
+    return input_items, files
+
+
+def build_responses_payload(
+    *,
+    model: str,
+    input_items: list[dict],
+    temperature: float = 0.7,
+    top_p: float = 0.95,
+    reasoning_effort: str | None = None,
+    max_output_tokens: int = 1000000,
+    store: bool = False,
+    include: list[str] | None = None,
+    tools: list[dict] | None = None,
+    tool_choice: Any = None,
+    stream: bool = True,
+    instructions: str | None = None,
+    request_overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the JSON payload for POST https://console.x.ai/v1/responses."""
+    payload: dict[str, Any] = {
+        "model":             model,
+        "input":             input_items,
+        "max_output_tokens": max_output_tokens,
+        "temperature":       temperature,
+        "top_p":             top_p,
+        "store":             store,
+        "include":           include or ["reasoning.encrypted_content"],
+        "tools": (
+            list(tools)
+            if tools is not None
+            else [dict(t) for t in _DEFAULT_RESPONSES_TOOLS]
+        ),
+        "tool_choice":       "auto" if tool_choice is None else tool_choice,
+        "stream":            stream,
+    }
+    if reasoning_effort and reasoning_effort != "none":
+        payload["reasoning"] = {"effort": reasoning_effort}
+    if instructions:
+        payload["instructions"] = instructions
+    if request_overrides:
+        payload.update({k: v for k, v in request_overrides.items() if v is not None})
+    return payload
+
+
+def _content_to_input_parts(content: Any) -> tuple[list[dict], list[str]]:
+    if isinstance(content, str):
+        text = content.strip()
+        return ([{"type": "input_text", "text": text}] if text else []), []
+    if not isinstance(content, list):
+        text = str(content).strip() if content is not None else ""
+        return ([{"type": "input_text", "text": text}] if text else []), []
+
+    parts: list[dict] = []
+    files: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype in ("text", "input_text"):
+            text = str(block.get("text") or "").strip()
+            if text:
+                parts.append({"type": "input_text", "text": text})
+        elif btype in ("image_url", "input_image"):
+            src = block.get("image_url") or block.get("source") or {}
+            url = src.get("url", "") if isinstance(src, dict) else str(src or "")
+            if url:
+                files.append(url)
+                parts.append({"type": "input_image", "image_url": url})
+        elif btype in ("input_audio", "file"):
+            inner = block.get(btype) or {}
+            data = (
+                inner.get("data") or inner.get("file_data", "")
+                if isinstance(inner, dict)
+                else ""
+            )
+            if data:
+                files.append(data)
+    return parts, files
+
+
+def _content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        pieces: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") in ("text", "input_text", "output_text"):
+                text = str(block.get("text") or "").strip()
+                if text:
+                    pieces.append(text)
+        return "\n".join(pieces).strip()
+    return str(content).strip() if content is not None else ""
+
+
 def build_chat_payload(
     *,
     message:               str,
@@ -302,6 +462,10 @@ class StreamAdapter:
             return []
         raise_for_stream_error(obj)
 
+        console_events = self._feed_console_response(obj)
+        if console_events is not None:
+            return console_events
+
         result = obj.get("result")
         if not result:
             return []
@@ -453,6 +617,78 @@ class StreamAdapter:
             events.append(FrameEvent("soft_stop"))
             return events
 
+        return events
+
+    def _feed_console_response(self, obj: dict[str, Any]) -> list[FrameEvent] | None:
+        """Parse console.x.ai Responses API SSE payloads captured in HAR."""
+        event_type = obj.get("type")
+        if not isinstance(event_type, str) or not event_type.startswith("response."):
+            return None
+
+        events: list[FrameEvent] = []
+        if event_type == "response.output_text.delta":
+            token = str(obj.get("delta") or "")
+            if token:
+                self._content_started = True
+                self.text_buf.append(token)
+                events.append(FrameEvent("text", token))
+            return events
+
+        if event_type == "response.output_text.annotation.added":
+            ann = obj.get("annotation")
+            if isinstance(ann, dict):
+                self._annotations.append(ann)
+                events.append(FrameEvent("annotation", annotation_data=ann))
+            return events
+
+        if event_type == "response.completed":
+            if not self.text_buf:
+                events.extend(self._events_from_completed_response(obj.get("response")))
+            events.append(FrameEvent("soft_stop"))
+            return events
+
+        if event_type in {"response.failed", "response.incomplete"}:
+            response = obj.get("response")
+            error = response.get("error") if isinstance(response, dict) else None
+            if isinstance(error, dict):
+                raise UpstreamError(
+                    str(error.get("message") or "Upstream response failed"),
+                    status=502,
+                    body=orjson.dumps(error).decode()[:400],
+                )
+            events.append(FrameEvent("soft_stop"))
+            return events
+
+        return events
+
+    def _events_from_completed_response(self, response: Any) -> list[FrameEvent]:
+        if not isinstance(response, dict):
+            return []
+        events: list[FrameEvent] = []
+        output = response.get("output")
+        if not isinstance(output, list):
+            return events
+        for item in output:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") != "output_text":
+                    continue
+                text = str(part.get("text") or "")
+                if text:
+                    self.text_buf.append(text)
+                    events.append(FrameEvent("text", text))
+                annotations = part.get("annotations")
+                if isinstance(annotations, list):
+                    for ann in annotations:
+                        if isinstance(ann, dict):
+                            self._annotations.append(ann)
+                            events.append(
+                                FrameEvent("annotation", annotation_data=ann)
+                            )
         return events
 
     # ------------------------------------------------------------------
@@ -662,6 +898,9 @@ class StreamAdapter:
 
 
 __all__ = [
+    "upstream_model_name",
+    "build_console_input",
+    "build_responses_payload",
     "build_chat_payload",
     "classify_line",
     "FrameEvent",

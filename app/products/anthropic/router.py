@@ -110,8 +110,8 @@ async def messages_endpoint(req: MessagesRequest):
         system       = req.system,
         stream       = is_stream,
         emit_think   = emit_think,
-        temperature  = req.temperature or 0.8,
-        top_p        = req.top_p or 0.95,
+        temperature  = req.temperature if req.temperature is not None else 0.7,
+        top_p        = req.top_p if req.top_p is not None else 0.95,
         tools        = req.tools or None,
         tool_choice  = req.tool_choice,
     )
